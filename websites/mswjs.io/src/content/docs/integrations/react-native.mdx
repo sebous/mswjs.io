@@ -8,44 +8,68 @@ keywords:
   - ios
   - android
   - mobile
+  - bare
+  - cli
 ---
 
 import { Warning } from '@mswjs/shared/components/react/warning'
+import { Info } from '@mswjs/shared/components/react/info'
 
-In React Native, MSW works similarly to Node.js, but omits certain request interceptors for modules that are not present in React Native, like the standard `http` module in Node.js.
+In React Native, MSW works similarly to Node.js, but uses `fetch` and `XMLHttpRequest` interceptors instead of the `http`/`https` modules that don't exist in React Native.
 
-<Warning>
-  **This integration is potentially incomplete**. If you are a React Native
-  developer, please follow these steps and share any discrepancies/missing
-  pieces with us on [GitHub](https://github.com/mswjs/mswjs.io/issues). Let's
-  improve the React Native integration guidelines together.
-</Warning>
+This guide covers **React Native CLI (bare)** projects. If you're using **Expo Router**, see the [Expo Router integration](/docs/integrations/expo-router).
 
 ## Prerequisites
 
+### React Native version
+
+MSW requires React Native **0.73+** with the Hermes engine.
+
 ### Polyfills
 
-MSW relies on standard JavaScript classes that are not present in React Native, like `URL`. Please install the polyfills below to guarantee proper MSW execution in React Native.
+React Native 0.84+ includes most Web API globals natively. The only polyfill needed is `CustomEvent`, which Hermes does not yet provide.
 
-```sh
-npm install react-native-url-polyfill fast-text-encoding
-```
-
-Create a new `msw.polyfills.js` file with the following content:
+Create a `msw.polyfills.js` file:
 
 ```js
 // msw.polyfills.js
-import 'fast-text-encoding'
-import 'react-native-url-polyfill/auto'
+if (typeof globalThis.CustomEvent === 'undefined') {
+  globalThis.CustomEvent = class CustomEvent extends Event {
+    detail
+    constructor(type, init) {
+      super(type, init)
+      this.detail = init?.detail ?? null
+    }
+  }
+}
 ```
 
-We will import this file later, when [Enabling mocking](#enable-mocking).
+<Info>
+  On React Native **0.72–0.83**, additional polyfills are needed. See [Older
+  React Native versions](#older-react-native-versions) below.
+</Info>
+
+### Babel plugin
+
+MSW uses [class static blocks](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Classes/Static_initialization_blocks) which Hermes does not support natively. Add the Babel transform:
+
+```sh
+npm install --save-dev @babel/plugin-transform-class-static-block
+```
+
+```js
+// babel.config.js
+module.exports = {
+  presets: ['module:@react-native/babel-preset'],
+  plugins: ['@babel/plugin-transform-class-static-block'],
+}
+```
 
 ## Setup
 
-Import the `setupServer` function from `msw/native` and call it, providing your request handlers as the argument.
+Import `setupServer` from `msw/native` and provide your request handlers.
 
-```js {2}
+```js
 // src/mocks/server.js
 import { setupServer } from 'msw/native'
 import { handlers } from './handlers'
@@ -63,48 +87,145 @@ export const server = setupServer(...handlers)
 
 ## Enable mocking
 
-### Development
+Import `server` in your application's entrypoint and call `server.listen()` conditionally for development.
 
-Import `server` in the entrypoint of your React Native application and call `server.listen()` _conditionally_.
-
-```js {6-14} /enableMocking/
+```js
 // index.js
-import { AppRegistry } from 'react-native'
-import App from './src/App'
-import { name as appName } from './app.json'
+import './msw.polyfills'
+import { server } from './src/mocks/server'
 
-async function enableMocking() {
-  if (!__DEV__) {
-    return
-  }
-
-  await import('./msw.polyfills')
-  const { server } = await import('./src/mocks/server')
-  server.listen()
+if (__DEV__) {
+  server.listen({ onUnhandledRequest: 'bypass' })
 }
 
-enableMocking().then(() => {
-  AppRegistry.registerComponent(appName, () => App)
-})
+import { AppRegistry } from 'react-native'
+import App from './App'
+import { name as appName } from './app.json'
+
+AppRegistry.registerComponent(appName, () => App)
 ```
 
-> Don't forget to import the `msw.polyfills.js` module!
+<Info>
+  Import polyfills **before** MSW. The polyfill module must execute first so the
+  globals are available when MSW initializes.
+</Info>
 
-### Testing
+## Testing
 
-When testing your React Native application, the way you set up MSW will differ based on how you run your tests. For example, for unit/integration testing where you render your React components in isolation, you should follow the regular [Node.js integration](/docs/integrations/node) to configure MSW with tools like Vitest or Jest.
+When testing your React Native application, how you set up MSW depends on how you run your tests.
 
-For end-to-end testing, make sure you have [Enabled MSW in development](#development) and spawn the instance of your React Native application accordingly (feel free to introduce new environment variables just for that). That way, you will be running your end-to-end tests against the application instance that has MSW up and running.
+For **unit/integration testing** where you render components in isolation (Jest, Vitest), follow the regular [Node.js integration](/docs/integrations/node).
+
+For **end-to-end testing**, make sure you have [enabled MSW in development](#enable-mocking) and spawn your React Native application accordingly. Your e2e tests will run against an instance with MSW active.
 
 ## Common issues
 
 ### Unable to resolve module `http`
 
-**Reason:** Your React Native code ends up importing the `http` module that doesn't exist in React Native.
+Your code is importing `msw/node` instead of `msw/native`.
 
-**Solution:** Find the incorrect `msw/node` import in your application and replace it with `msw/native`.
-
-```diff /native/
+```diff
 -import { setupServer } from 'msw/node'
 +import { setupServer } from 'msw/native'
+```
+
+### `new Proxy target must be an Object`
+
+MSW's WebSocket handler wraps `Event` methods in a Proxy. If `Event.prototype.stopPropagation` or `stopImmediatePropagation` are `undefined`, the Proxy constructor throws. The `CustomEvent` polyfill above extends `Event`, which should cover this. If using an older `event-target-polyfill`, ensure these methods exist:
+
+```js
+if (typeof Event.prototype.stopPropagation !== 'function') {
+  Event.prototype.stopPropagation = function () {}
+}
+if (typeof Event.prototype.stopImmediatePropagation !== 'function') {
+  Event.prototype.stopImmediatePropagation = function () {}
+}
+```
+
+## Older React Native versions
+
+On React Native **0.72–0.83**, Hermes is missing several Web API globals. Install additional polyfills:
+
+```sh
+npm install react-native-url-polyfill fast-text-encoding event-target-polyfill web-streams-polyfill
+```
+
+Expand your `msw.polyfills.js`:
+
+```js
+// msw.polyfills.js
+import 'event-target-polyfill'
+import 'fast-text-encoding'
+import 'react-native-url-polyfill/auto'
+import 'web-streams-polyfill/polyfill'
+
+if (typeof globalThis.CustomEvent === 'undefined') {
+  globalThis.CustomEvent = class CustomEvent extends Event {
+    detail
+    constructor(type, init) {
+      super(type, init)
+      this.detail = init?.detail ?? null
+    }
+  }
+}
+
+// MessageEvent (needed by MSW WebSocket internals)
+if (typeof globalThis.MessageEvent === 'undefined') {
+  globalThis.MessageEvent = class MessageEvent extends Event {
+    data
+    origin
+    lastEventId
+    constructor(type, init) {
+      super(type)
+      this.data = init?.data ?? null
+      this.origin = init?.origin ?? ''
+      this.lastEventId = init?.lastEventId ?? ''
+    }
+  }
+}
+
+// BroadcastChannel (instantiated by msw/core/ws at import time)
+if (typeof globalThis.BroadcastChannel === 'undefined') {
+  globalThis.BroadcastChannel = class BroadcastChannel {
+    name
+    onmessage = null
+    constructor(name) {
+      this.name = name
+    }
+    postMessage() {}
+    close() {}
+    addEventListener() {}
+    removeEventListener() {}
+  }
+}
+
+// window — MSW's ws.link() calls window.addEventListener at import time
+if (typeof window === 'undefined') {
+  globalThis.window = globalThis
+}
+if (typeof window.addEventListener !== 'function') {
+  const et = new EventTarget()
+  window.addEventListener = et.addEventListener.bind(et)
+  window.removeEventListener = et.removeEventListener.bind(et)
+  window.dispatchEvent = et.dispatchEvent.bind(et)
+}
+
+// Event methods needed by MSW's WebSocket Proxy
+if (typeof Event.prototype.stopPropagation !== 'function') {
+  Event.prototype.stopPropagation = function () {}
+}
+if (typeof Event.prototype.stopImmediatePropagation !== 'function') {
+  Event.prototype.stopImmediatePropagation = function () {}
+}
+
+// XMLHttpRequest.getAllResponseHeaders returns null in RN — MSW expects string
+const origGetAll = XMLHttpRequest.prototype.getAllResponseHeaders
+XMLHttpRequest.prototype.getAllResponseHeaders = function () {
+  return origGetAll.call(this) ?? ''
+}
+
+// XMLHttpRequestUpload — MSW does instanceof checks against it
+if (typeof globalThis.XMLHttpRequestUpload === 'undefined') {
+  globalThis.XMLHttpRequestUpload = class XMLHttpRequestUpload extends EventTarget {}
+}
 ```

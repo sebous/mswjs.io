@@ -1,0 +1,180 @@
+---
+order: 4
+title: Expo Router integration
+description: Set up Mock Service Worker in Expo Router (Expo SDK 55+).
+keywords:
+  - expo
+  - expo-router
+  - native
+  - react
+  - ios
+  - android
+  - mobile
+---
+
+import { Warning } from '@mswjs/shared/components/react/warning'
+import { Info } from '@mswjs/shared/components/react/info'
+
+This guide covers **Expo Router** projects (Expo SDK 55+, React Native 0.83+). For bare React Native CLI projects, see the [React Native integration](/docs/integrations/react-native).
+
+MSW works in Expo the same way as in bare React Native — it intercepts `fetch` and `XMLHttpRequest` — but Expo's bundler and Hermes version require a broader set of polyfills.
+
+## Prerequisites
+
+### Polyfills
+
+Expo SDK 55 ships React Native 0.83 with Hermes, which is missing several Web API globals that MSW depends on. Install the following:
+
+```sh
+npx expo install event-target-polyfill fast-text-encoding react-native-url-polyfill web-streams-polyfill
+```
+
+Create a `msw.polyfills.js` file in your project root:
+
+```js
+// msw.polyfills.js
+import 'event-target-polyfill'
+import 'fast-text-encoding'
+import 'react-native-url-polyfill/auto'
+import 'web-streams-polyfill/polyfill'
+
+// window — MSW's ws.link() calls window.addEventListener at import time
+if (typeof window === 'undefined') {
+  globalThis.window = globalThis
+}
+if (typeof window.addEventListener !== 'function') {
+  const et = new EventTarget()
+  window.addEventListener = et.addEventListener.bind(et)
+  window.removeEventListener = et.removeEventListener.bind(et)
+  window.dispatchEvent = et.dispatchEvent.bind(et)
+}
+
+// Event methods needed by MSW's WebSocket Proxy
+if (typeof Event.prototype.stopPropagation !== 'function') {
+  Event.prototype.stopPropagation = function () {}
+}
+if (typeof Event.prototype.stopImmediatePropagation !== 'function') {
+  Event.prototype.stopImmediatePropagation = function () {}
+}
+
+// MessageEvent (needed by MSW WebSocket/SSE internals)
+if (typeof globalThis.MessageEvent === 'undefined') {
+  globalThis.MessageEvent = class MessageEvent extends Event {
+    data
+    origin
+    lastEventId
+    constructor(type, init) {
+      super(type)
+      this.data = init?.data ?? null
+      this.origin = init?.origin ?? ''
+      this.lastEventId = init?.lastEventId ?? ''
+    }
+  }
+}
+
+// XMLHttpRequest.getAllResponseHeaders returns null in RN — MSW expects string
+const origGetAll = XMLHttpRequest.prototype.getAllResponseHeaders
+XMLHttpRequest.prototype.getAllResponseHeaders = function () {
+  return origGetAll.call(this) ?? ''
+}
+
+// XMLHttpRequestUpload — MSW does instanceof checks against it
+if (typeof globalThis.XMLHttpRequestUpload === 'undefined') {
+  globalThis.XMLHttpRequestUpload = class XMLHttpRequestUpload extends EventTarget {}
+}
+
+// BroadcastChannel (instantiated by msw/core/ws at import time)
+if (typeof globalThis.BroadcastChannel === 'undefined') {
+  globalThis.BroadcastChannel = class BroadcastChannel {
+    name
+    onmessage = null
+    constructor(name) {
+      this.name = name
+    }
+    postMessage() {}
+    close() {}
+    addEventListener() {}
+    removeEventListener() {}
+  }
+}
+```
+
+<Info>
+  As Expo and Hermes add native support for these APIs, you can remove the
+  corresponding polyfills. Test by commenting them out and checking for runtime
+  errors.
+</Info>
+
+## Setup
+
+Import `setupServer` from `msw/native` and provide your request handlers.
+
+```js
+// src/mocks/server.js
+import { setupServer } from 'msw/native'
+import { handlers } from './handlers'
+
+export const server = setupServer(...handlers)
+```
+
+<Warning>
+  In React Native and Expo, import `setupServer` from `msw/native` — not
+  `msw/node`. The `/native` export uses `fetch` and `XMLHttpRequest`
+  interceptors instead of Node.js `http`/`https`.
+</Warning>
+
+## Enable mocking
+
+Expo Router uses a custom entry point. Create or edit `index.js` (or `index.ts`) in your project root and set it as `"main"` in `package.json`.
+
+```json
+{
+  "main": "./index"
+}
+```
+
+```js
+// index.js
+import 'expo-router/entry'
+import './msw.polyfills'
+import { server } from './src/mocks/server'
+
+if (__DEV__) {
+  server.listen({ onUnhandledRequest: 'bypass' })
+}
+```
+
+<Info>
+  Import polyfills **before** MSW. The polyfill module must execute first so the
+  globals are available when MSW initializes. The `expo-router/entry` import
+  must come first to set up the router.
+</Info>
+
+## Testing
+
+For **unit/integration testing** (Jest, Vitest) where you render components in isolation, follow the regular [Node.js integration](/docs/integrations/node).
+
+For **end-to-end testing** with Maestro or Detox, ensure MSW is [enabled in development](#enable-mocking). Your e2e tests run against the dev build which has MSW active.
+
+## Common issues
+
+### Unable to resolve module `http`
+
+Your code is importing `msw/node` instead of `msw/native`.
+
+```diff
+-import { setupServer } from 'msw/node'
++import { setupServer } from 'msw/native'
+```
+
+### `new Proxy target must be an Object`
+
+MSW's WebSocket handler wraps `Event` methods in a Proxy. If `Event.prototype.stopPropagation` or `stopImmediatePropagation` are `undefined`, the Proxy constructor throws. The polyfill file above patches these methods.
+
+### `global "URL" class is not defined`
+
+The `react-native-url-polyfill/auto` import is missing or not executing before MSW. Ensure it's imported in `msw.polyfills.js` and that the polyfill file is imported before the MSW server.
+
+### Expo's custom `fetch` is not intercepted
+
+`import { fetch } from 'expo/fetch'` is a separate implementation that MSW cannot intercept. MSW patches the **global** `fetch`. Use the global `fetch` (no import needed) for requests you want MSW to handle.
